@@ -137,6 +137,7 @@ def plot(live: list[float], width: int = 60, height: int = 9,
          overlay: list[float] | None = None,
          overlay_xs: list[float] | None = None,
          smooth: int = 0,
+         guides: list[float] | None = None,
          live_style: str = "green",
          overlay_style: str = "blue",
          smooth_style: str = "yellow",
@@ -167,9 +168,25 @@ def plot(live: list[float], width: int = 60, height: int = 9,
         ma_bits = _bits_for(moving_average(live, smooth), plot_w, height,
                             lo, hi)
 
+    # Reference lines at the band edges inside the visible range. Drawn as a
+    # literal row of dots per human-meaningful dBm so "am I below -67" is a
+    # glance, not a calculation against the axis numbers.
+    guide_rows: dict[int, float] = {}
+    for g in guides or []:
+        if lo < g < hi:
+            row = int((hi - g) / (hi - lo) * (height * 4 - 1))
+            # skip guides that would sit on the top/bottom edge labels
+            if 2 <= row < height * 4 - 2:
+                guide_rows[row] = g
+
     text = Text()
     for cy in range(height):
         for cx in range(plot_w):
+            # a guide dot sits underneath everything else
+            guide_hit = any(
+                cy * 4 <= r < cy * 4 + 4 and guide_rows
+                for r in guide_rows
+            )
             live_c = _cell(live_bits, cx, cy)
             over_c = _cell(over_bits, cx, cy) if over_bits else 0
             ma_c = _cell(ma_bits, cx, cy) if ma_bits else 0
@@ -184,18 +201,23 @@ def plot(live: list[float], width: int = 60, height: int = 9,
                 text.append(chr(0x2800 | live_c), style=live_style)
             elif over_c:
                 text.append(chr(0x2800 | over_c), style=overlay_style)
+            elif guide_hit:
+                text.append("·", style="grey30")
             else:
                 text.append(" ")
         if axis:
+            guide_here = [g for r, g in guide_rows.items() if r // 4 == cy]
             if cy == 0:
-                label = f"{hi:5.0f} "
-            elif cy == height // 2:
-                label = f"{(hi + lo) / 2:5.0f} "
+                label, style = f"{hi:5.0f} ", "dim"
             elif cy == height - 1:
-                label = f"{lo:5.0f} "
+                label, style = f"{lo:5.0f} ", "dim"
+            elif guide_here:
+                label, style = f"{guide_here[0]:5.0f} ", "grey42"
+            elif cy == height // 2:
+                label, style = f"{(hi + lo) / 2:5.0f} ", "dim"
             else:
-                label = "      "
-            text.append(label, style="dim")
+                label, style = "      ", "dim"
+            text.append(label, style=style)
         if cy != height - 1:
             text.append("\n")
     return text

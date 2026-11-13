@@ -19,3 +19,9 @@ repo grows real contributor docs.
   compared on a common window, and a 6-hour blob makes that window useless.
 - Comparison refuses a verdict under 10 samples. Sigma on three points is
   noise dressed up as statistics.
+- Band colours live in ui.py, not scattered through widgets. If a threshold
+  changes it should change in one place: -50 excellent, -60 good, -67 fair,
+  -75 weak, below that poor. These are comfortable round numbers, not physics.
+- The main screen degrades by dropping information, never by wrapping. Under
+  110 cols the percentile columns go, under 34 rows the band legend goes,
+  under 32 rows the header loses its sparkline.

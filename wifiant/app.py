@@ -35,6 +35,8 @@ from . import speedtest
 from .chart import plot
 from .collector import Collector
 from .stats import Sample
+from .ui import (BANDS, ago, band, delta_text, dur, gauge, keycaps, meter,
+                 quality_style, spark)
 
 FAINT = "dim"
 
@@ -52,6 +54,17 @@ def big_signal(sample: Sample | None, value: str | None = None) -> Text:
     txt.append(value or f"{sample.signal:5.1f}", style=style)
     txt.append(" dBm", style="dim")
     return txt
+
+
+def stable_meter(frac: float, width: int = 5) -> Text:
+    """Small block meter for the 0..1 stability figure."""
+    frac = 0.0 if frac < 0 else 1.0 if frac > 1 else frac
+    n = int(round(frac * width))
+    t = Text("stable ", style="grey42")
+    t.append("█" * n, style=quality_style(frac * 100))
+    t.append("░" * (width - n), style="grey30")
+    t.append(f" {frac * 100:3.0f}%", style="grey42")
+    return t
 
 
 def arrow(delta: float) -> tuple[str, str]:
@@ -108,11 +121,18 @@ class FocusScreen(ModalScreen):
             d = last.signal - self.tare
             txt = Text()
             txt.append(f"{d:+7.1f}", style="bold green" if d >= 0 else "bold red")
-            txt.append(" dB", style=FAINT)
+            txt.append(" dB", style="grey42")
+            self.query_one("#focus-signal", Static).update(txt)
+        elif last:
+            label, style = band(last.signal)
+            txt = Text()
+            txt.append(f"{last.signal:7.1f}", style=f"bold {style}")
+            txt.append(" dBm", style="grey42")
+            txt.append(f"   {label}", style=style)
             self.query_one("#focus-signal", Static).update(txt)
         else:
             self.query_one("#focus-signal", Static).update(
-                big_signal(last, f"{last.signal:7.1f}" if last else None)
+                Text("  --  dBm", style="grey42")
             )
 
         bits = []
@@ -127,12 +147,63 @@ class FocusScreen(ModalScreen):
             d = now.mean - self.baseline.stats.mean
             a, _ = arrow(d)
             bits.append(f"{a} {d:+.1f} dB vs {self.baseline.label}")
-        self.query_one("#focus-sub", Static).update("    ".join(bits))
+        sub = Text("    ".join(bits), style="grey62")
+        self.query_one("#focus-sub", Static).update(sub)
+        self.query_one("#focus-hint", Static).update(
+            "esc back   ·   f focus   ·   t tare   ·   m smooth"
+        )
 
         vals = h.values(180)
-        chart = plot(vals, width=min(78, self.size.width - 12), height=9,
-                     smooth=10)
+        chart = plot(vals, width=min(96, self.size.width - 10), height=10,
+                     smooth=10, guides=[-50, -60, -67, -75])
         self.query_one("#focus-chart", Static).update(chart)
+
+
+class KeysScreen(ModalScreen):
+    """Full binding list, grouped. The footer only has room for the common
+    ones once you add tare/smooth/overlay/autorecord."""
+
+    BINDINGS = [Binding("escape", "dismiss", "back")]
+
+    GROUPS = [
+        ("measuring", [
+            ("r", "record / stop the current run"),
+            ("t", "tare — zero here, read deltas"),
+            ("m", "smoothing on/off"),
+            ("n", "auto-record in 10 min segments"),
+            ("p", "ping the gateway now"),
+            ("x", "throughput probe"),
+        ]),
+        ("looking", [
+            ("f", "focus mode — one number, one trace"),
+            ("v", "overlay the best saved run"),
+            ("⇧↑ / ⇧↓", "tighten / loosen the chart range"),
+            ("l", "quick log: best, median, outliers"),
+        ]),
+        ("revisions", [
+            ("a", "new revision"),
+            ("d", "switch revision"),
+            ("s", "runs list — mark two, c compares"),
+            ("c", "compare the two most recent runs"),
+        ]),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog", classes="keys"):
+            yield Label("keys", id="d-title")
+            body = Text()
+            for title, items in self.GROUPS:
+                if body.plain:
+                    body.append("\n")
+                body.append(f"  {title.upper()}\n", style="bold grey42")
+                for k, what in items:
+                    body.append(f"  {k:<12}", style="bold cyan")
+                    body.append(f"{what}\n", style="grey62")
+            yield Static(body, id="keys-body")
+            yield Static("esc back", id="pick-hint")
+
+    def action_dismiss(self, result=None) -> None:  # type: ignore[override]
+        self.dismiss(result)
 
 
 class NewDesignScreen(ModalScreen):
@@ -228,6 +299,7 @@ class SessionsScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "back"),
         Binding("c", "compare", "compare"),
+        Binding("question_mark", "help_keys", "keys", key_display="?"),
         Binding("d", "delete", "delete"),
     ]
 
@@ -361,23 +433,36 @@ class CompareScreen(Screen):
 
     def paint(self) -> None:
         cmp = self.lab.compare(self.a, self.b, self.window)
-        self.query_one("#compare-head", Static).update(
-            f"[bold]A[/] {self.a.design}  {self.a.sid[-9:]}\n"
-            f"[bold]B[/] {self.b.design}  {self.b.sid[-9:]}\n"
-            f"[dim]window {cmp.window:.0f}s   ←/→ change[/]"
-        )
+        head = Text()
+        head.append("A  ", style="bold blue")
+        head.append(f"{self.a.design}", style="bold")
+        head.append(f"  {time.strftime('%d %b %H:%M', time.localtime(self.a.started))}",
+                    style="grey42")
+        head.append(f"  {dur(self.a.span)}\n", style="grey35")
+        head.append("B  ", style="bold cyan")
+        head.append(f"{self.b.design}", style="bold")
+        head.append(f"  {time.strftime('%d %b %H:%M', time.localtime(self.b.started))}",
+                    style="grey42")
+        head.append(f"  {dur(self.b.span)}\n", style="grey35")
+        head.append(f"comparing first {dur(cmp.window)} of each", style="grey42")
+        head.append("   ←/→ change", style="grey30")
+        self.query_one("#compare-head", Static).update(head)
         rows = Text()
-        rows.append(f"{'':12}{'mean':>8}{'median':>9}{'jitter':>9}{'stable':>8}\n",
-                    style=FAINT)
-        for tag, st, stab in ((f"A  {self.a.sid[-6:]}", cmp.a_stats, cmp.a_stability),
-                              (f"B  {self.b.sid[-6:]}", cmp.b_stats, cmp.b_stability)):
-            rows.append(f"{tag:<12}")
+        rows.append(f"{'':12}{'mean':>8}{'median':>9}{'spread':>9}{'stable':>8}\n",
+                    style="grey35")
+        better = "A" if cmp.delta < 0 else "B"
+        for tag, st, stab in ((f"A  {self.a.design}"[:12], cmp.a_stats, cmp.a_stability),
+                              (f"B  {self.b.design}"[:12], cmp.b_stats, cmp.b_stability)):
+            style = "bold blue" if tag.startswith("A") else "bold cyan"
+            rows.append(f"{tag:<12}", style=style)
             if st.count:
+                _, sig_style = band(st.mean)
                 stab_txt = f"{stab * 100:6.0f}%" if stab is not None else "    --"
-                rows.append(f"{st.mean:8.1f}{st.median:9.1f}{st.stdev:9.1f}"
-                            f"{stab_txt:>7}\n")
+                rows.append(f"{st.mean:8.1f}", style=sig_style)
+                rows.append(f"{st.median:9.1f}{st.stdev:9.1f}{stab_txt:>8}\n")
             else:
-                rows.append("        --       --       --      --\n", style=FAINT)
+                rows.append("        --       --       --      --\n", style="grey30")
+        _ = better
         self.query_one("#compare-stats", Static).update(rows)
 
         a_vals = self.a.values(self.window)
@@ -385,14 +470,23 @@ class CompareScreen(Screen):
         if a_vals and b_vals:
             xs_a = [p[0] / self.window for p in self.a.series if p[0] <= self.window]
             self.query_one("#compare-chart", Static).update(
-                plot(b_vals, width=min(76, self.size.width - 12), height=10,
+                plot(b_vals, width=max(40, self.size.width - 12), height=11,
+                     guides=[-50, -60, -67, -75],
                      overlay=a_vals, overlay_xs=xs_a,
                      live_style="green", overlay_style="blue")
             )
         verdict = cmp.verdict()
-        self.query_one("#compare-legend", Static).update(
-            f"[bold]{verdict}[/]\n[dim]green = A   blue = B   yellow = both[/]"
-        )
+        vt = Text()
+        worse = "noise" in verdict or "weak" in verdict or "run longer" in verdict
+        vt.append(verdict, style="bold dark_orange" if worse else "bold bright_green")
+        vt.append("\n")
+        vt.append("─" * 8 + " ", style="blue")
+        vt.append("A   ", style="grey42")
+        vt.append("─" * 8 + " ", style="cyan")
+        vt.append("B   ", style="grey42")
+        vt.append("─" * 8 + " ", style="yellow")
+        vt.append("both", style="grey42")
+        self.query_one("#compare-legend", Static).update(vt)
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -401,20 +495,43 @@ class CompareScreen(Screen):
 class WifiAnt(App):
     CSS = """
     Screen { background: $surface; }
-    #header { height: 7; padding: 0 1; border: round $primary; }
+    #header {
+        height: 5; padding: 0 1;
+        background: $panel;
+        border-bottom: heavy $primary 40%;
+    }
+    #header.compact { height: 3; }
+    #header.compact #headline-spark { display: none; }
+    #headline { height: 1; text-overflow: ellipsis; }
+    #headline-sub { height: 1; text-overflow: ellipsis; }
+    #headline-spark { height: 1; text-overflow: ellipsis; }
     #body { height: 1fr; }
-    #left { width: 2fr; }
-    #right { width: 34; border-left: solid $primary 30%; padding: 0 1; }
-    #chart { height: 1fr; border: round $primary 40%; padding: 0 1; }
-    #stats { height: 9; border: round $primary 30%; padding: 0 1; }
+    #left { width: 1fr; }
+    #right {
+        width: 34; padding: 0 1;
+        border-left: solid $primary 25%;
+    }
+    #chart {
+        height: 1fr; padding: 0 1;
+        border: round $primary 35%;
+    }
+    #stats {
+        height: 10; padding: 0 1;
+        border-top: solid $primary 25%;
+    }
+    #section-title { color: $text-muted; text-style: bold; height: 1; }
     #focus-box { align: center middle; width: 100%; height: 100%; }
     #focus-signal { text-align: center; text-style: bold; }
     #focus-sub, #focus-chart, #focus-hint { text-align: center; }
     #focus-hint { dock: bottom; color: $text-disabled; }
+    ModalScreen { align: center middle; background: $background 60%; }
     #dialog { width: 64; height: auto; padding: 1 2; border: thick $primary;
               background: $surface; }
     #dialog-buttons { height: 3; align-horizontal: right; }
     #pick-list { height: auto; max-height: 16; }
+    #keys-body { height: auto; width: 1fr; }
+    KeysScreen #dialog { width: 62; }
+
     #pick-hint { color: $text-disabled; }
     #sessions-wrap, #compare-wrap { padding: 0 2; }
     #sessions-head, #compare-head { height: auto; padding: 1 0; }
@@ -433,9 +550,10 @@ class WifiAnt(App):
         Binding("r", "record", "record"),
         Binding("s", "sessions", "sessions"),
         Binding("c", "compare", "compare"),
+        Binding("question_mark", "help_keys", "keys", key_display="?"),
         Binding("x", "speed", "speedtest"),
-        Binding("l", "log", "log"),
-        Binding("p", "ping", "ping"),
+        Binding("l", "log", "log", show=False),
+        Binding("p", "ping", "ping", show=False),
         Binding("v", "overlay", "overlay"),
         Binding("m", "smooth", "smooth"),
         Binding("t", "tare", "tare"),
@@ -484,6 +602,8 @@ class WifiAnt(App):
 
     def on_mount(self) -> None:
         self.collector.start()
+        if self.size.height < 32:
+            self.query_one("#header").add_class("compact")
         self.set_interval(1.0, self.paint)
         self.set_interval(5.0, self._autorecord_tick)
         self.refresh_baseline()
@@ -508,6 +628,18 @@ class WifiAnt(App):
         if self.recorder and last is not None:
             self.recorder.feed(last)
 
+        # border_title gives the chart pane a name without eating a text line
+        try:
+            from .ui import band as _band
+
+            label, _ = _band(last.signal if last else None)
+            self.query_one("#chart", Static).border_title = (
+                f"signal · {label}" if not self.overlay else "signal · overlay"
+            )
+
+        except Exception:
+            pass
+
         head = Text()
         if last and self.tare_value is not None:
             # measured against where you zeroed it, so a trim shows up as
@@ -518,14 +650,14 @@ class WifiAnt(App):
             head.append(f"   from tare at {self.tare_value:.1f} dBm", style=FAINT)
             head.append("   t to clear", style=FAINT)
         elif last:
-            head.append("signal ", style=FAINT)
-            head.append(f"{last.signal:6.1f} dBm", style="bold green")
+            label, style = band(last.signal)
+            head.append(f"{last.signal:6.1f}", style=f"bold {style}")
+            head.append(" dBm ", style="grey42")
+            head.append(f" {label:<9}", style=style)
+            head.append_text(gauge(last.signal, width=16, show_label=False))
             if last.snr is not None:
-                window_vals = h.values(max(self.window, 60))
-                if window_vals:
-                    head.append(f"   {last.signal - min(window_vals):+.1f} vs window low",
-                                style=FAINT)
-            head.append(f"   {self.collector.iface or '?'}", style=FAINT)
+                head.append(f"  snr {last.snr:4.1f}", style="grey42")
+            head.append(f"   {self.collector.iface or '?'}", style="grey42")
             best_ever = h.best()
             if best_ever and last.signal > best_ever.signal:
                 head.append("   NEW BEST", style="bold magenta")
@@ -538,15 +670,26 @@ class WifiAnt(App):
         now = s["now"]
         sub = Text()
         if now.count:
-            sub.append(f"10s {now.mean:6.1f}   spread {now.jitter:4.1f}",
-                       style="")
+            sub.append(f"{now.mean:6.1f}", style="grey85")
+            sub.append(" 10s", style="grey42")
+            sub.append("   ")
+            sub.append_text(delta_text(now.mean - last.signal if last else 0.0,
+                                       small=0.3))
+            sub.append(" now", style="grey42")
         tr = s["trend"]
-        if tr is not None:
-            sub.append(f"   trend {tr:+5.1f} dB/min", style=FAINT)
-        sub.append(f"   stable {s['stability'] * 100:3.0f}%", style=FAINT)
+        if tr is not None and abs(tr) >= 0.3:
+            sub.append("   ")
+            sub.append_text(delta_text(tr, "dB/min", small=0.3))
+        sub.append("   ")
+        sub.append_text(stable_meter(s["stability"]))
         if last and last.chains:
-            sub.append("   chains " + " ".join(f"{c:.0f}" for c in last.chains),
-                       style=FAINT)
+            sub.append("   ", style="grey42")
+            for i, c in enumerate(last.chains):
+                _, st = band(c)
+                if i:
+                    sub.append(" / ", style="grey30")
+                sub.append(f"{c:.0f}", style=st)
+            sub.append(" chains", style="grey42")
         if self.recorder:
             sub.append(f"   ● REC {time.time() - self.recording_started:4.0f}s",
                        style="bold red")
@@ -554,15 +697,26 @@ class WifiAnt(App):
 
         # single-row hint trace under the big number
         vals = h.values(self.window)
-        self.query_one("#headline-spark", Static).update(
-            plot(vals, width=min(100, self.size.width - 6), height=3,
-                 live_style="green", axis=False)
-            if vals else Text("collecting…", style=FAINT)
-        )
+        if vals:
+            # auto-range the mini trace, otherwise a stable link is one flat
+            # block of identical glyphs and shows nothing
+            lo = min(vals) - 1
+            hi = max(vals) + 1
+            mini = Text()
+            mini.append(f"{dur(self.window):>5} ", style="grey30")
+            mini.append_text(spark(vals, width=min(110, self.size.width - 12),
+                                   lo=lo, hi=hi))
+            mini.append(" now", style="grey30")
+            self.query_one("#headline-spark", Static).update(mini)
+        else:
+            self.query_one("#headline-spark", Static).update(
+                Text("collecting…", style=FAINT)
+            )
 
         # main chart, optionally overlaid with the best run's trace
-        chart_w = max(30, self.size.width - 42)
-        chart_h = max(6, self.size.height - 22)
+        pane = self.query_one("#chart", Static)
+        chart_w = max(30, pane.size.width - 3)
+        chart_h = max(6, pane.size.height - 2)
         zoom_lo = zoom_hi = None
         if self.headroom:
             from .chart import auto_range
@@ -582,14 +736,17 @@ class WifiAnt(App):
             xs = [t / span for t, _ in pts]
             chart = plot(live_cut, width=chart_w, height=chart_h,
                          lo=zoom_lo, hi=zoom_hi, smooth=self.smooth,
+                         guides=[-50, -60, -67, -75],
                          overlay=[v for _, v in pts], overlay_xs=xs)
-            chart.append("\n", style=FAINT)
-            chart.append(f"aligned view · last {span:.0f}s now vs "
-                         f"{self.baseline.span:.0f}s run ({self.baseline.label})",
-                         style=FAINT)
+            chart.append("\n")
+            chart.append("─" * 8 + " ", style="blue")
+            chart.append("now   ", style="grey50")
+            chart.append("─" * 8 + " ", style="cyan")
+            chart.append(f"saved run {self.baseline.label}", style="grey50")
         else:
             chart = plot(vals, width=chart_w, height=chart_h,
-                         lo=zoom_lo, hi=zoom_hi, smooth=self.smooth)
+                         lo=zoom_lo, hi=zoom_hi, smooth=self.smooth,
+                         guides=[-50, -60, -67, -75])
         self.query_one("#chart", Static).update(chart)
 
         self.query_one("#stats", Static).update(self.stats_panel(s))
@@ -597,109 +754,203 @@ class WifiAnt(App):
 
     def stats_panel(self, s: dict) -> Text:
         t = Text()
-        t.append(f"{'window':<9}{'avg':>7}{'med':>7}{'spread':>8}{'p10':>7}{'p90':>7}\n",
-                 style=FAINT)
+        t.append("  WINDOWS\n", style="grey42")
+        # narrow terminals get fewer columns rather than wrapped rows
+        narrow = self.size.width < 110
+        t.append(f"{'':<9}{'avg':>7}{'med':>7}{'spread':>8}", style="grey35")
+        if not narrow:
+            t.append(f"{'p10':>8}{'p90':>7}", style="grey35")
+        t.append("\n")
         for label, st in (("10 s", s["now"]), ("1 min", s["min1"]),
                           ("5 min", s["min5"]), ("session", s["session"])):
+            t.append(f"{label:<9}", style="grey50")
             if not st.count:
-                t.append(f"{label:<9}      --\n", style=FAINT)
+                t.append("      --\n", style=FAINT)
                 continue
-            t.append(f"{label:<9}{st.mean:7.1f}{st.median:7.1f}{st.jitter:8.1f}"
-                     f"{st.p10:7.1f}{st.p90:7.1f}\n")
+            _, style = band(st.mean)
+            t.append(f"{st.mean:7.1f}", style=style)
+            t.append(f"{st.median:7.1f}")
+            t.append(f"{st.jitter:8.1f}", style="grey50")
+            if not narrow:
+                t.append(f"{st.p10:8.1f}", style="grey50")
+                t.append(f"{st.p90:7.1f}", style="grey50")
+            t.append("\n")
+        t.append("  trend ", style="grey42")
+        if s["trend"] is not None:
+            t.append_text(delta_text(s["trend"], "dB/min", small=0.3))
+        else:
+            t.append("needs a minute of data", style="grey35")
+        t.append("\n")
+
+        # second block: the slower-moving facts, on one wrapped line each
+        t.append("\n")
         lat = s["latency"]
-        if lat:
-            t.append("\nlatency  ")
-            if lat["avg"] is not None:
-                t.append(f"{lat['avg']:5.1f} ms", style="bold")
-                t.append(f"   jitter {lat['jitter']:.1f}   loss {lat['loss']:.0f}%"
-                         f"   → {lat['host']}", style=FAINT)
-            else:
-                t.append("no reply", style="bold red")
-        t.append(f"\nlink coverage {s['coverage'] * 100:3.0f}%", style=FAINT)
+        t.append("latency  ", style="grey50")
+        if lat and lat["avg"] is not None:
+            style = ("bright_green" if lat["avg"] < 20
+                     else "green" if lat["avg"] < 50
+                     else "yellow" if lat["avg"] < 100 else "red")
+            t.append(f"{lat['avg']:5.1f} ms", style=f"bold {style}")
+            t.append(f"   jitter {lat['jitter']:.1f}   loss {lat['loss']:.0f}%"
+                     f"   → {lat['host']}", style="grey42")
+        elif lat:
+            t.append("no reply", style="bold red")
+        else:
+            t.append("─", style=FAINT)
+
+        cov = s["coverage"]
+        t.append("\ncoverage ", style="grey50")
+        t.append(meter(cov, 10), style="grey42")
+        t.append(f" {cov * 100:3.0f}%", style="grey50")
         if s["reconnects"]:
-            t.append(f"   drops {s['reconnects']}", style=FAINT)
+            t.append(f"   drops {s['reconnects']}", style="yellow")
+        t.append(f"   samples {s['samples']:,}", style="grey42")
         return t
 
     def right_panel(self, s: dict) -> Text:
+        """Three stacked cards: what I'm measuring, how it compares, how it's
+        doing on the wire. Each one answerable at a glance."""
         t = Text()
         design = self.lab.load(self.design_slug) if self.design_slug else None
-        t.append("revision\n", style="bold")
-        if design:
-            t.append(f"{design.name}\n", style="bold cyan")
-        else:
-            t.append("none selected\n", style=FAINT)
-            t.append("d pick   a new\n", style=FAINT)
 
-        t.append("\nbest this session\n", style="bold")
+        # ---- card 1: the revision under test ---------------------------
+        if design:
+            t.append("  " + design.name + "\n", style="bold cyan")
+            runs = len(self.lab.sessions(design.slug))
+            t.append(f"  {runs} run{'s' if runs != 1 else ''}", style="grey42")
+            if self.recorder:
+                t.append("  ·  ")
+                t.append("REC", style="bold red")
+                t.append(f" {dur(self.recorder.elapsed)}", style="grey42")
+            elif self.autorecord:
+                t.append("  ·  ")
+                t.append("AUTO", style="dark_orange")
+            t.append("\n")
+        else:
+            t.append("  no revision selected\n", style="grey42")
+            t.append("  ")
+            t.append_text(keycaps(("d", "pick"), ("a", "new")))
+            t.append("\n")
+
+        # ---- card 2: comparison --------------------------------------
+        t.append("\n")
+        t.append("  PEAK\n", style="grey42")
         best = self.collector.history.best()
         if best:
-            t.append(f"{best.signal:5.1f} dBm", style="")
-            age = time.time() - best.ts
-            t.append(("   just now\n" if age < 90 else f"   {age / 60:.0f}m ago\n"),
-                     style=FAINT)
+            _, style = band(best.signal)
+            t.append(f"  {best.signal:6.1f} dBm", style=f"bold {style}")
+            t.append(f"   {ago(time.time() - best.ts)}\n", style="grey42")
             now = s["now"]
-            if now.count:
-                gap = now.mean - best.signal
-                a, style = arrow(gap)
-                t.append(f"{a} current is {abs(gap):.1f} below peak\n", style=style)
+            if now.count and now.mean < best.signal:
+                t.append("  ", style="grey50")
+                t.append_text(delta_text(now.mean - best.signal, ""))
+                t.append(" below peak\n", style="grey42")
 
-        t.append("\nvs best run\n", style="bold")
-        if self.baseline:
-            if s["now"].count and self.baseline.stats.count:
-                d = s["now"].mean - self.baseline.stats.mean
-                a, style = arrow(d)
-                t.append(f"{a} {d:+.1f} dB\n", style=style)
-                t.append(f"{self.baseline.label} · median "
-                         f"{self.baseline.stats.mean:.1f}\n", style=FAINT)
+        t.append("\n")
+        t.append("  VS BEST RUN\n", style="grey42")
+        if self.baseline and s["now"].count and self.baseline.stats.count:
+            d = s["now"].mean - self.baseline.stats.mean
+            t.append("  ")
+            t.append_text(delta_text(d))
+            t.append("\n")
+            t.append(f"  {self.baseline.label} · {self.baseline.stats.mean:.1f} dBm\n",
+                     style="grey42")
+            # only claim significance when there's enough data behind it
+            samples = self.baseline.stats.count
+            if abs(d) < 0.5:
+                t.append("  within noise\n", style="grey42")
+            elif samples < 10:
+                t.append("  short run - not conclusive\n", style="dark_orange")
             else:
-                t.append("waiting for samples\n", style=FAINT)
+                t.append("  meaningful\n")
+        elif self.baseline:
+            t.append("  waiting for samples\n", style="grey42")
         else:
-            t.append("no saved runs yet\n", style=FAINT)
-            t.append("record with r\n", style=FAINT)
+            t.append("  nothing recorded yet\n", style="grey42")
+            t.append("  ")
+            t.append_text(keycaps(("r", "record")))
+            t.append("\n")
 
-        if self.recorder:
-            snap = self.recorder.snapshot()
-            st = snap.stats()
-            t.append("\nrecording\n", style="bold red")
-            t.append(f"{snap.span:.0f}s  {len(snap.series)} buckets\n", style=FAINT)
-            if st.count:
-                t.append(f"avg {st.mean:.1f}  jitter {st.stdev:.1f}\n", style=FAINT)
-
+        # ---- card 3: the wire ----------------------------------------
         if self._probe and self._probe.running:
-            t.append("\nthroughput\n", style="bold")
-            t.append(f"running… {self._probe.live_mbps():5.1f} Mb/s\n")
+            t.append("\n  THROUGHPUT\n", style="grey42")
+            live = self._probe.live_mbps()
+            t.append(f"  {live:6.1f} Mb/s", style="bold yellow")
+            t.append("  measuring…\n", style="grey42")
         elif self.speed:
-            t.append("\nthroughput\n", style="bold")
+            t.append("\n  THROUGHPUT\n", style="grey42")
             if self.speed.ok:
-                t.append(f"{self.speed.mbps:5.1f} Mb/s", style="bold green")
-                t.append(f"\nttfb {self.speed.ttfb * 1000:.0f} ms  "
-                         f"{self.speed.elapsed:.1f}s\n", style=FAINT)
+                style = ("bright_green" if self.speed.mbps > 100
+                         else "green" if self.speed.mbps > 40
+                         else "yellow" if self.speed.mbps > 10 else "red")
+                t.append(f"  {self.speed.mbps:6.1f} Mb/s", style=f"bold {style}")
+                t.append(f"\n  ttfb {self.speed.ttfb * 1000:.0f} ms · "
+                         f"{self.speed.elapsed:.1f}s\n", style="grey42")
             else:
-                t.append(f"failed: {self.speed.error}\n", style="red")
+                t.append(f"  failed\n", style="red")
+                t.append(f"  {self.speed.error[:28]}\n", style="grey42")
 
         last = self.collector.history.last
         if last and (last.rx or last.tx):
-            t.append("\nphy rate (negotiated)\n", style="bold")
+            t.append("\n  PHY RATE\n", style="grey42")
             if last.tx:
-                t.append(f"tx {last.tx:5.0f} Mb/s   ", style=FAINT)
+                t.append(f"  tx {last.tx:4.0f}", style="grey50")
             if last.rx:
-                t.append(f"rx {last.rx:5.0f} Mb/s", style=FAINT)
-            t.append("\n", style=FAINT)
+                t.append(f"   rx {last.rx:4.0f}", style="grey50")
+            t.append(" Mb/s\n", style="grey42")
+            t.append("  negotiated, not throughput\n", style="grey30")
 
-        t.append("\nkeys\n", style="bold")
-        for k, v in (("r", "record / stop"), ("s", "runs + compare"),
-                     ("x", "speed test"), ("f", "focus mode"),
-                     ("t", "tare to now"), ("m", "smoothing on/off"),
-                     ("n", "auto-record"), ("⇧↑⇩", "chart range")):
-            t.append(f"  {k:<3} {v}\n", style=FAINT)
-        state = []
+        # recent runs fill what would otherwise be dead space, and are the
+        # thing you actually scroll back through while iterating
+        if design:
+            runs = self.lab.sessions(design.slug)
+            if runs:
+                t.append("\n  RECENT RUNS\n", style="grey42")
+                best_med = max((r.stats().median for r in runs if r.stats().count),
+                               default=None)
+                for r in runs[-5:][::-1]:
+                    st = r.stats()
+                    if not st.count:
+                        continue
+                    stamp = time.strftime("%H:%M", time.localtime(r.started))
+                    t.append(f"  {stamp} ", style="grey35")
+                    t.append(f"{st.median:6.1f}", style="")
+                    t.append(f"  {dur(r.span):>5}", style="grey35")
+                    if best_med is not None and abs(st.median - best_med) < 1e-9:
+                        t.append("  best", style="bright_green")
+                    else:
+                        t.append("", style="")
+                    t.append("\n")
+
+        # ---- state chips --------------------------------------------
+        chips = []
         if self.tare_value is not None:
-            state.append(f"tare {self.tare_value:.1f}")
-        state.append(f"smooth {'off' if not self.smooth else str(self.smooth)}")
+            chips.append(f"tare {self.tare_value:.1f}")
+        chips.append(f"smooth {'off' if not self.smooth else self.smooth}")
+        if self.overlay:
+            chips.append("overlay")
         if self.autorecord:
-            state.append("AUTO-REC")
-        t.append("  " + "  ".join(state) + "\n", style=FAINT if not self.autorecord
-                 else "bold red")
+            chips.append("auto-rec")
+        t.append("\n  ")
+        for i, c in enumerate(chips):
+            if i:
+                t.append(" ", style="grey30")
+            t.append(f" {c} ", style="reverse grey42")
+        t.append("\n")
+
+        # band legend. Sits at the bottom because you read it twice and then
+        # stop; skipped entirely on short terminals where it would clip.
+        if self.size.height < 34:
+            return t
+        t.append("\n  BANDS\n", style="grey42")
+        for limit, label, style in BANDS:
+            t.append("  ")
+            t.append("━" * 3, style=style)
+            t.append(f" {label:<9}", style=style)
+            if limit > -900:
+                t.append(f"above {limit}\n", style="grey30")
+            else:
+                t.append("everything else\n", style="grey30")
         return t
 
     # -- baseline --------------------------------------------------------
@@ -728,6 +979,9 @@ class WifiAnt(App):
             self.baseline = None
 
     # -- actions ---------------------------------------------------------
+    def action_help_keys(self) -> None:
+        self.push_screen(KeysScreen())
+
     def action_focus(self) -> None:
         self.push_screen(FocusScreen(self.collector, self.baseline,
                                      self.tare_value))
