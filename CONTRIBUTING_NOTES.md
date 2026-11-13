@@ -13,3 +13,9 @@ repo grows real contributor docs.
   otherwise; sigma is reported so it can be argued with.
 - Overlays are time-aligned by duration, not absolute clock time, and always
   labelled. Stretching a 5 s run across a 2 min axis was misleading.
+- Tare is read-only bookkeeping in the app; it never touches the sampler, so
+  the recorded absolute values stay comparable across runs.
+- Auto-record splits at 10 minutes rather than one giant run: sessions are
+  compared on a common window, and a 6-hour blob makes that window useless.
+- Comparison refuses a verdict under 10 samples. Sigma on three points is
+  noise dressed up as statistics.

@@ -141,3 +141,94 @@ def test_gateway_is_parsed():
 
 def test_pick_iface_prefers_explicit():
     assert radio.pick_iface("wlan9") == "wlan9"
+
+
+# -- new features -------------------------------------------------------
+def test_moving_average_is_trailing_not_centred():
+    from wifiant.chart import moving_average
+
+    vals = [0, 0, 0, 10]
+    ma = moving_average(vals, 2)
+    # the last point only pulls the average halfway; it must not "know" the
+    # future the way a centred filter would
+    assert ma[-1] == pytest.approx(5.0)
+    assert ma[0] == pytest.approx(0.0)
+    assert len(ma) == len(vals)
+
+
+def test_smoothing_keeps_plot_shape():
+    from wifiant.chart import plot
+
+    raw = [-60.0, -55.0, -65.0, -58.0] * 20
+    plain = plot(raw, width=30, height=5, smooth=0)
+    smooth = plot(raw, width=30, height=5, smooth=8)
+    assert len(plain.plain.splitlines()) == len(smooth.plain.splitlines())
+    assert any(0x2800 <= ord(c) <= 0x28FF for c in smooth.plain)
+
+
+def test_short_run_verdict_refuses_to_call_it():
+    a = designs.SessionMeta(sid="a", design="x", started=0,
+                            series=[[0, -50.0, 1], [1, -50.0, 1]])
+    b = designs.SessionMeta(sid="b", design="x", started=0,
+                            series=[[0, -54.0, 1], [1, -54.0, 1]])
+    verdict = designs.Comparison(
+        a=a, b=b, window=2,
+        a_stats=a.stats(), b_stats=b.stats(),
+        a_stability=a.stability(), b_stability=b.stability(),
+    ).verdict()
+    assert "run longer" in verdict
+
+
+def test_tare_delta_arithmetic():
+    tare = -52.3
+    sample = Sample(ts=0, signal=-51.1)
+    assert sample.signal - tare == pytest.approx(1.2)
+
+
+def test_watch_analysis_finds_the_dip_hour(tmp_path):
+    import time as _time
+
+    from wifiant import watch
+
+    base = _time.mktime((2026, 11, 12, 0, 0, 0, 0, 0, -1))
+    rows = []
+    for hour in range(24):
+        for minute in range(0, 60, 5):
+            t = base + hour * 3600 + minute * 60
+            # afternoon slump at 15:00
+            mean = -58.0 if hour == 15 else -50.0
+            rows.append({"t": t, "mean": mean, "lo": mean, "hi": mean, "n": 1})
+    rep = watch.analyse(rows)
+    assert rep.best_hour == 0
+    assert rep.worst_hour == 15
+    assert rep.dips, "should have found the afternoon dip"
+    assert rep.dips[0]["low"] == pytest.approx(-58.0)
+
+
+def test_watch_daylog_appends_jsonl(tmp_path, monkeypatch):
+    from wifiant import watch
+
+    monkeypatch.setenv("WIFIANT_HOME", str(tmp_path))
+    log = watch.DayLog(design="v1")
+    log.append({"t": 1000.0, "mean": -51.0})
+    log.append({"t": 1060.0, "mean": -52.0})
+    files = watch.DayLog.files()
+    assert len(files) == 1
+    rows = watch.DayLog.load(files[0])
+    assert [r["mean"] for r in rows] == [-51.0, -52.0]
+
+
+def test_plot_survives_two_points():
+    from wifiant.chart import plot
+
+    text = plot([-60.0, -55.0], width=40, height=6)
+    body = [ln for ln in text.plain.splitlines() if any(
+        0x2800 <= ord(c) <= 0x28FF for c in ln)]
+    assert body, "a two-sample series should still draw something"
+
+
+def test_plot_survives_a_single_point():
+    from wifiant.chart import plot
+
+    text = plot([-60.0], width=30, height=4)
+    assert any(0x2800 <= ord(c) <= 0x28FF for c in text.plain)

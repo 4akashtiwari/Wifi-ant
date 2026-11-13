@@ -27,6 +27,8 @@ needs three things it doesn't give you:
 | which revision was better | — | revisions + recorded runs + verdict |
 | latency and real throughput | — | gateway ping + on-demand speed probe |
 | was it my antenna or my position | — | runs are recorded per revision |
+| did *this one trim* help | — | tare: zero here, read deltas |
+| when is my link actually good | — | `watch` a whole day, `analyze` it |
 
 ## Install
 
@@ -63,6 +65,9 @@ wifiant --iface wlp2s0  # watch a specific interface
 | `x` | throughput probe (downloads ~25 MB, counts, discards) |
 | `l` | quick log: best, median, outliers |
 | `p` | ping the gateway right now |
+| `t` | tare — zero the reading here, so the next trim reads as `+0.6 dB` |
+| `m` | smoothing on/off (10-sample trailing average drawn over the raw trace) |
+| `n` | auto-record — keeps saving 10-minute segments until you turn it off |
 | `⇧↑`/`⇧↓` | tighten/loosen the chart's y window |
 
 ## Revisions and runs
@@ -102,6 +107,16 @@ mean -54.1   median -54.0   jitter 1.1   stable 98%
 B wins by 4.0 dB (3.6 sigma)
 ```
 
+### Tare: measuring one trim at a time
+
+The bit that actually helps at the bench. Sit the antenna in a jig, press `t`,
+and the big number switches from dBm to **delta from that spot**. Bend an
+element, watch it go `+0.6 dB`. Bend it back, watch it go `-0.2`. No mental
+arithmetic, and the chart still shows the absolute trace underneath.
+
+Tare is a *reading aid*, not a calibration — it answers "did that change
+anything", not "what is my gain".
+
 ### Headless
 
 ```sh
@@ -110,7 +125,38 @@ wifiant stats                          # one shot
 wifiant history --seconds 60           # sample and plot in the terminal
 wifiant config                         # JSON, for a tmux status bar/script
 wifiant sweep --rescan                 # what the antenna can see, best first
+wifiant export -o sessions.csv         # every recorded second, for pandas/R
 ```
+
+### Watching a whole day
+
+`record` is for a session at the bench. `watch` is the other timescale — leave
+it running and find out when your link is actually good:
+
+```sh
+wifiant watch --design v4 --interval 60      # until ^C, one row per minute
+wifiant watch --design v4 --duration 43200   # or 12 h
+wifiant analyze                              # what the day looked like
+```
+
+One file per day under `~/.local/share/wifiant/watch/`, one line per interval
+(`mean`, `lo`, `hi`, `noise`, `snr`, timestamp). `analyze` prints the mean
+signal and noise floor per hour, the best one-hour window, and any run of
+consecutive low samples:
+
+```
+mean signal by hour
+00 ██████████  -51   01 ██████████  -51   02 ███████████ -50
+...
+15 ████        -58   16 ██████      -55   17 █████████   -52
+
+dips (runs at least 6 dB below median)
+start            length   low
+12 Nov 15:04     22m      -58.9
+```
+
+That afternoon row is usually the neighbours coming home, not your antenna.
+Worth knowing before you rebuild a good design.
 
 ## What it actually measures
 
@@ -120,6 +166,9 @@ wifiant sweep --rescan                 # what the antenna can see, best first
   an element and watching the number in real time.
 - **stability** is the share of samples within ±1.5 dB of the window median.
   A higher gain with a worse stability score is not an upgrade on a moving link.
+- **smoothing** is a *trailing* moving average, deliberately not centred: while
+  you're holding an element you want the line to follow what just happened,
+  not to quietly rewrite the past.
 - **outliers** use median + MAD, not mean + σ, because a fade dip would
   otherwise hide itself inside the average it drags down.
 - **throughput** is a real download (Cloudflare's speed endpoint by default,
@@ -147,7 +196,8 @@ wifiant/
   collector.py  background sampler thread + ring history
   stats.py      windows, robust anomalies, quality score
   designs.py    revisions, recorded runs, comparisons
-  chart.py      braille plots (2x4 dots per cell)
+  chart.py      braille plots (2x4 dots per cell), smoothing, hourly bars
+  watch.py      day-scale logging and analysis
   app.py        the TUI
   cli.py        subcommands
   scan.py       nearby APs

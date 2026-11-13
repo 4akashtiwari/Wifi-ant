@@ -16,15 +16,17 @@
 from __future__ import annotations
 
 import argparse
+import pathlib
 import signal
 import sys
 import time
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-from . import __version__, designs, radio, speedtest
-from .chart import plot
+from . import __version__, designs, radio, speedtest, watch
+from .chart import hourly_bars, plot
 from .stats import Sample
 
 console = Console()
@@ -346,6 +348,132 @@ def cmd_sweep(args) -> int:
     return 0
 
 
+def cmd_watch(args) -> int:
+    """Long-run logging. One line per interval, one file per day."""
+    iface = radio.pick_iface(args.iface)
+    if not iface and not args.demo:
+        console.print("[red]no wireless interface[/]")
+        return 2
+    if args.design and designs.Lab().load(args.design) is None:
+        console.print(f"[red]no such design: {args.design}[/]")
+        return 2
+
+    from . import mock
+    from .collector import Collector
+
+    collector = Collector(iface=iface, demo=args.demo,
+                          interval=min(2.0, args.interval),
+                          ping_host=args.ping_host).start()
+    flag = {"stop": False}
+    watch.install_signal_handlers(flag)
+
+    console.print(f"[dim]watching {iface or 'demo'} every {args.interval:.0f}s"
+                  + (f" for {args.duration:.0f}s" if args.duration else "")
+                  + " — ^C to stop[/]")
+    started_rows = 0
+
+    def tick(row: dict) -> None:
+        nonlocal started_rows
+        started_rows += 1
+        if args.verbose:
+            console.print(f"  {time.strftime('%H:%M:%S', time.localtime(row['t']))}"
+                          f"  {row['mean']:6.1f} dBm  ({row['lo']:.0f}..{row['hi']:.0f})")
+
+    class _StopAware:
+        """Tiny shim so run_watch can see the signal flag without knowing
+        about the collector."""
+
+        def __init__(self, coll, flag):
+            self.history = coll.history
+            self.iface = coll.iface
+            self._flag = flag
+
+        @property
+        def stopped(self) -> bool:
+            return self._flag["stop"]
+
+    log = watch.run_watch(_StopAware(collector, flag), args.design,
+                          args.interval, args.duration, on_tick=tick)
+    collector.stop()
+
+    if not log.rows:
+        console.print("[yellow]nothing logged[/]")
+        return 0
+    rep = watch.analyse(log.rows)
+    console.print(f"[green]{started_rows} rows written[/]  "
+                  f"{watch.watch_dir()}")
+    console.print(f"covered {rep.total:.1f} h   spread {rep.spread:.1f} dB")
+    if rep.best_hour is not None:
+        console.print(f"best hour {rep.best_hour:02d}:00 "
+                      f"({rep.hours[rep.best_hour]:.1f} dBm)   "
+                      f"worst {rep.worst_hour:02d}:00 "
+                      f"({rep.hours[rep.worst_hour]:.1f} dBm)")
+    return 0
+
+
+def cmd_analyze(args) -> int:
+    files = watch.DayLog.files()
+    if args.file:
+        files = [p for p in files if args.file in p.name]
+    if not files:
+        console.print("[dim]no watch logs yet - wifiant watch --design NAME[/]")
+        return 0
+    rows: list[dict] = []
+    for f in files:
+        rows.extend(watch.DayLog.load(f))
+    if not rows:
+        console.print("[red]logs are empty[/]")
+        return 0
+
+    rep = watch.analyse(rows, args.dip_threshold)
+    console.print(f"[bold]{len(rows)} samples[/] over {rep.total:.1f} h "
+                  f"from {len(files)} file(s)")
+    console.print(f"spread {rep.spread:.1f} dB   "
+                  f"best hour {rep.best_hour:02d}:00   "
+                  f"worst hour {rep.worst_hour:02d}:00")
+    if rep.best_window and rep.total >= 1.0:
+        console.print(f"best one-hour window "
+                      f"{time.strftime('%d %b %H:%M', time.localtime(rep.best_window[0]))}"
+                      f" – {time.strftime('%H:%M', time.localtime(rep.best_window[1]))}")
+
+    console.print()
+    console.print(Text("mean signal by hour", style="bold"))
+    console.print(hourly_bars(rep.hours))
+
+    if rep.noise_by_hour:
+        console.print()
+        console.print(Text("noise floor by hour", style="bold"))
+        console.print(hourly_bars(rep.noise_by_hour))
+
+    if rep.dips:
+        console.print()
+        table = Table(title="dips (runs at least "
+                            f"{args.dip_threshold:.0f} dB below median)")
+        table.add_column("start")
+        table.add_column("length")
+        table.add_column("low")
+        for d in rep.dips[:15]:
+            table.add_row(
+                time.strftime("%d %b %H:%M", time.localtime(d["start"])),
+                f"{d['end'] - d['start']:.0f}s",
+                f"{d['low']:.1f}",
+            )
+        console.print(table)
+    return 0
+
+
+def cmd_export(args) -> int:
+    lab = designs.Lab()
+    out = pathlib.Path(args.output).expanduser() if args.output else None
+    path, rows = lab.export_csv(out, args.design)
+    if rows:
+        console.print(f"[green]{rows} rows[/] → {path}")
+    else:
+        console.print("[yellow]no recorded sessions yet[/] - run a recording "
+                      "first (wifiant record NAME, or r in the TUI)")
+    return 0
+
+
 def cmd_tui(args) -> int:
     from .app import run
 
@@ -413,6 +541,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--url", default=None)
     sp.add_argument("--size", type=int, default=5_000_000)
     sp.set_defaults(func=cmd_speed)
+
+    w = sub.add_parser("watch", help="log the link for hours into a day file")
+    w.add_argument("--design", help="tag the log with a revision")
+    w.add_argument("--interval", type=float, default=60.0,
+                   help="seconds between logged rows (default 60)")
+    w.add_argument("--duration", type=float, default=0,
+                   help="stop after N seconds (default: until ^C)")
+    w.add_argument("--iface")
+    w.add_argument("--demo", action="store_true")
+    w.add_argument("--ping-host")
+    w.add_argument("--verbose", "-v", action="store_true")
+    w.set_defaults(func=cmd_watch)
+
+    an = sub.add_parser("analyze", help="report on watch logs")
+    an.add_argument("--file", help="only files whose name contains this")
+    an.add_argument("--dip-threshold", type=float, default=6.0)
+    an.set_defaults(func=cmd_analyze)
+
+    ex = sub.add_parser("export", help="dump sessions to CSV")
+    ex.add_argument("--design", help="only this revision")
+    ex.add_argument("--output", "-o")
+    ex.set_defaults(func=cmd_export)
 
     cf = sub.add_parser("config", help="one-shot JSON dump for scripting")
     cf.add_argument("--iface")

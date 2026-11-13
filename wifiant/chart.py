@@ -8,6 +8,8 @@ whole screen every frame.
 
 from __future__ import annotations
 
+from collections import deque
+
 from rich.text import Text
 
 # braille dot -> bit, in the order the cells lay them out
@@ -56,6 +58,24 @@ def _resample(series: list[float], points: int) -> list[float]:
     return out
 
 
+def moving_average(values: list[float], window: int) -> list[float]:
+    """Trailing average. Trailing rather than centred on purpose: when you're
+    holding an element and watching the number, you want the line to react to
+    what just happened, not to smooth the past."""
+    if window <= 1 or not values:
+        return list(values)
+    q: deque[float] = deque()
+    total = 0.0
+    out = []
+    for v in values:
+        q.append(v)
+        total += v
+        if len(q) > window:
+            total -= q.popleft()
+        out.append(total / len(q))
+    return out
+
+
 def _bits_for(series: list[float], width: int, height: int, lo: float, hi: float,
               xs: list[float] | None = None) -> list[list[int]]:
     w, h = width * 2, height * 4
@@ -71,8 +91,10 @@ def _bits_for(series: list[float], width: int, height: int, lo: float, hi: float
     def col(i: int) -> int:
         if xs:
             x = int(xs[i] * (w - 1))
+        elif len(series) == 1:
+            x = w - 1
         else:
-            x = int(i * (w - 1) / max(1, len(series) - 1))
+            x = int(i * (w - 1) / (len(series) - 1))
         return max(0, min(w - 1, x))
 
     prev = None
@@ -114,14 +136,17 @@ def plot(live: list[float], width: int = 60, height: int = 9,
          lo: float | None = None, hi: float | None = None,
          overlay: list[float] | None = None,
          overlay_xs: list[float] | None = None,
+         smooth: int = 0,
          live_style: str = "green",
          overlay_style: str = "blue",
+         smooth_style: str = "yellow",
          axis: bool = True) -> Text:
     """Render one series, optionally against another on the same axes.
 
     ``overlay_xs`` lets a recorded session share the live time axis (0..1),
     which is what makes "now vs best run" a fair visual comparison. Pass
-    ``lo``/``hi`` to pin the range, otherwise it fits the data.
+    ``lo``/``hi`` to pin the range, otherwise it fits the data. ``smooth`` is
+    a trailing moving-average window in samples, drawn over the raw trace.
     """
     everything = list(live) + list(overlay or [])
     auto_lo, auto_hi = auto_range(everything)
@@ -137,13 +162,23 @@ def plot(live: list[float], width: int = 60, height: int = 9,
     over_bits = (
         _bits_for(overlay, plot_w, height, lo, hi, overlay_xs) if overlay else None
     )
+    ma_bits = None
+    if smooth > 1 and len(live) >= 3:
+        ma_bits = _bits_for(moving_average(live, smooth), plot_w, height,
+                            lo, hi)
 
     text = Text()
     for cy in range(height):
         for cx in range(plot_w):
             live_c = _cell(live_bits, cx, cy)
             over_c = _cell(over_bits, cx, cy) if over_bits else 0
-            if live_c and over_c:
+            ma_c = _cell(ma_bits, cx, cy) if ma_bits else 0
+            if ma_c and (live_c or over_c):
+                text.append(chr(0x2800 | live_c | over_c | ma_c),
+                            style="bold " + smooth_style)
+            elif ma_c:
+                text.append(chr(0x2800 | ma_c), style=smooth_style)
+            elif live_c and over_c:
                 text.append(chr(0x2800 | live_c | over_c), style="yellow")
             elif live_c:
                 text.append(chr(0x2800 | live_c), style=live_style)
@@ -166,13 +201,35 @@ def plot(live: list[float], width: int = 60, height: int = 9,
     return text
 
 
-def dual_spark(values: list[float], width: int = 40, lo: float = -100,
-               hi: float = -20) -> Text:
-    """Cheap single-row trace for headers."""
-    blocks = "▁▂▃▄▅▆▇█"
+def hourly_bars(by_hour: dict[int, float], width: int = 14,
+                columns: int = 3) -> Text:
+    """Bars for each hour of the day, laid out as a grid so it fits a terminal.
+    Used by `wifiant analyze` to show the shape of a day at a glance."""
     text = Text()
-    span = max(1.0, hi - lo)
-    for v in values[-width:]:
-        idx = int((v - lo) / span * (len(blocks) - 1))
-        text.append(blocks[max(0, min(len(blocks) - 1, idx))])
+    if not by_hour:
+        return text
+    vals = list(by_hour.values())
+    lo, hi = auto_range(vals, minimum_span=4.0)
+    span = max(1e-9, hi - lo)
+    cell = width + 10
+
+    def bar_for(hour: int) -> tuple[str, str]:
+        v = by_hour.get(hour)
+        if v is None:
+            return f"{hour:02d} " + "·" * width + "     ", "dim"
+        frac = (v - lo) / span
+        filled = max(1, int(round(frac * width)))
+        style = "green" if frac > 0.66 else "yellow" if frac > 0.33 else "red"
+        return f"{hour:02d} " + "█" * filled, style
+
+    for row_start in range(0, 24, columns):
+        for hour in range(row_start, min(row_start + columns, 24)):
+            label, style = bar_for(hour)
+            used = len(label) + (7 if hour in by_hour else 0)
+            text.append(label, style=style)
+            if hour in by_hour:
+                text.append(f"{by_hour[hour]:6.0f} ", style="dim")
+            else:
+                text.append(" " * max(0, cell - used), style="dim")
+        text.append("\n")
     return text

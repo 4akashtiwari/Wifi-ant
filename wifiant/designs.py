@@ -194,14 +194,16 @@ class Comparison:
     def verdict(self) -> str:
         if not self.a_stats.count or not self.b_stats.count:
             return "not enough data"
+        short = min(self.a_stats.count, self.b_stats.count) < 10
         d = self.delta
         pooled = ((self.a_stats.stdev ** 2 + self.b_stats.stdev ** 2) / 2) ** 0.5
-        if pooled > 0:
-            sig = abs(d) / pooled
-        else:
-            sig = abs(d) * 10
+        sig = abs(d) / pooled if pooled > 0 else abs(d) * 10
         if abs(d) < 0.5:
             return f"noise - only {abs(d):.1f} dB apart"
+        if short:
+            return (f"{abs(d):.1f} dB apart but only "
+                    f"{min(self.a_stats.count, self.b_stats.count)}s of data - "
+                    f"run longer")
         if sig < 1.0:
             return f"weak - {abs(d):.1f} dB apart, but inside jitter"
         better = "B" if d > 0 else "A"
@@ -210,7 +212,13 @@ class Comparison:
 
 class Lab:
     def __init__(self, root: Path | None = None):
-        self.root = (root or data_home()) / "designs"
+        # A caller passing a directory means "the designs live here"; a bare
+        # data home also works, so both `Lab(tmp_path)` and `Lab()` are sane.
+        base = root or data_home()
+        if base.name == "designs":
+            self.root = base
+        else:
+            self.root = base / "designs"
         self.root.mkdir(parents=True, exist_ok=True)
 
     # -- designs ---------------------------------------------------------
@@ -312,6 +320,30 @@ class Lab:
                 f.unlink()
                 n += 1
         return n
+
+    # -- export ----------------------------------------------------------
+    def export_csv(self, out: Path | None = None,
+                   design: str | None = None) -> tuple[Path, int]:
+        """One row per recorded second, all designs or just one. Columns are
+        chosen so pandas/R/gnuplot can take the file as-is:
+        timestamp, design, session, seconds, signal, samples."""
+        import csv
+
+        out = out or (self.root.parent / "sessions.csv")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        rows = 0
+        with open(out, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["started_iso", "design", "session_id", "t_seconds",
+                             "signal_dbm", "samples"])
+            for sess in self.sessions(design):
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                      time.localtime(sess.started))
+                for t, mean, n in sess.series:
+                    writer.writerow([stamp, sess.design, sess.sid, f"{t:.1f}",
+                                     f"{mean:.2f}", n])
+                    rows += 1
+        return out, rows
 
     # -- comparison ------------------------------------------------------
     def compare(self, a: SessionMeta, b: SessionMeta,

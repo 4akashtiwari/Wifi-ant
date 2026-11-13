@@ -78,10 +78,12 @@ class FocusScreen(ModalScreen):
 
     BINDINGS = [Binding("escape", "dismiss", "back")]
 
-    def __init__(self, collector: Collector, baseline: Baseline | None = None):
+    def __init__(self, collector: Collector, baseline: Baseline | None = None,
+                 tare: float | None = None):
         super().__init__()
         self.collector = collector
         self.baseline = baseline
+        self.tare = tare
 
     def compose(self) -> ComposeResult:
         with Container(id="focus-box"):
@@ -102,9 +104,16 @@ class FocusScreen(ModalScreen):
         now = s["now"]
         last = h.last
 
-        self.query_one("#focus-signal", Static).update(
-            big_signal(last, f"{last.signal:7.1f}" if last else None)
-        )
+        if last and self.tare is not None:
+            d = last.signal - self.tare
+            txt = Text()
+            txt.append(f"{d:+7.1f}", style="bold green" if d >= 0 else "bold red")
+            txt.append(" dB", style=FAINT)
+            self.query_one("#focus-signal", Static).update(txt)
+        else:
+            self.query_one("#focus-signal", Static).update(
+                big_signal(last, f"{last.signal:7.1f}" if last else None)
+            )
 
         bits = []
         if now.count:
@@ -121,7 +130,8 @@ class FocusScreen(ModalScreen):
         self.query_one("#focus-sub", Static).update("    ".join(bits))
 
         vals = h.values(180)
-        chart = plot(vals, width=min(78, self.size.width - 12), height=9)
+        chart = plot(vals, width=min(78, self.size.width - 12), height=9,
+                     smooth=10)
         self.query_one("#focus-chart", Static).update(chart)
 
 
@@ -321,7 +331,9 @@ class CompareScreen(Screen):
         self.lab = lab
         self.a = a
         self.b = b
-        self.window = min(a.span, b.span) or 1.0
+        # both runs start at 0, so the honest window is the shorter one -
+        # but a run that barely started shouldn't produce a 0 s axis
+        self.window = max(5.0, min(a.span, b.span))
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -339,8 +351,12 @@ class CompareScreen(Screen):
         self.window = max(5.0, self.window - 15)
         self.paint()
 
+    @property
+    def _max_window(self) -> float:
+        return max(5.0, self.a.span, self.b.span)
+
     def action_grow(self) -> None:
-        self.window = min(max(self.a.span, self.b.span) or 5.0, self.window + 15)
+        self.window = min(self._max_window, self.window + 15)
         self.paint()
 
     def paint(self) -> None:
@@ -421,6 +437,9 @@ class WifiAnt(App):
         Binding("l", "log", "log"),
         Binding("p", "ping", "ping"),
         Binding("v", "overlay", "overlay"),
+        Binding("m", "smooth", "smooth"),
+        Binding("t", "tare", "tare"),
+        Binding("n", "autorecord", "autorec"),
         Binding("shift+up", "threshold(+5)", "ceiling up", show=False),
         Binding("shift+down", "threshold(-5)", "ceiling down", show=False),
     ]
@@ -441,7 +460,12 @@ class WifiAnt(App):
         self._probe: speedtest.ThroughputProbe | None = None
         self.window = window
         self.overlay = False
+        self.smooth = 10  # trailing moving-average window, samples; 0 = off
         self.headroom = 0.0  # manual y-axis fudge, shift+up/down
+        self.tare_value: float | None = None
+        self.tare_at: float | None = None
+        self.autorecord = False
+        self.breach_held = False
 
     # -- chrome ----------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -461,6 +485,7 @@ class WifiAnt(App):
     def on_mount(self) -> None:
         self.collector.start()
         self.set_interval(1.0, self.paint)
+        self.set_interval(5.0, self._autorecord_tick)
         self.refresh_baseline()
         self.title = "WifiAnt"
         self.sub_title = ""
@@ -484,7 +509,15 @@ class WifiAnt(App):
             self.recorder.feed(last)
 
         head = Text()
-        if last:
+        if last and self.tare_value is not None:
+            # measured against where you zeroed it, so a trim shows up as
+            # "+0.6 dB" instead of arithmetic you do in your head
+            d = last.signal - self.tare_value
+            head.append("delta ", style=FAINT)
+            head.append(f"{d:+6.1f} dB", style="bold green" if d >= 0 else "bold red")
+            head.append(f"   from tare at {self.tare_value:.1f} dBm", style=FAINT)
+            head.append("   t to clear", style=FAINT)
+        elif last:
             head.append("signal ", style=FAINT)
             head.append(f"{last.signal:6.1f} dBm", style="bold green")
             if last.snr is not None:
@@ -493,6 +526,9 @@ class WifiAnt(App):
                     head.append(f"   {last.signal - min(window_vals):+.1f} vs window low",
                                 style=FAINT)
             head.append(f"   {self.collector.iface or '?'}", style=FAINT)
+            best_ever = h.best()
+            if best_ever and last.signal > best_ever.signal:
+                head.append("   NEW BEST", style="bold magenta")
         else:
             head.append("no connection", style="bold red")
             if s["error"]:
@@ -545,7 +581,7 @@ class WifiAnt(App):
             pts = [(t, v) for t, v in self.baseline.points if t <= span]
             xs = [t / span for t, _ in pts]
             chart = plot(live_cut, width=chart_w, height=chart_h,
-                         lo=zoom_lo, hi=zoom_hi,
+                         lo=zoom_lo, hi=zoom_hi, smooth=self.smooth,
                          overlay=[v for _, v in pts], overlay_xs=xs)
             chart.append("\n", style=FAINT)
             chart.append(f"aligned view · last {span:.0f}s now vs "
@@ -553,7 +589,7 @@ class WifiAnt(App):
                          style=FAINT)
         else:
             chart = plot(vals, width=chart_w, height=chart_h,
-                         lo=zoom_lo, hi=zoom_hi)
+                         lo=zoom_lo, hi=zoom_hi, smooth=self.smooth)
         self.query_one("#chart", Static).update(chart)
 
         self.query_one("#stats", Static).update(self.stats_panel(s))
@@ -653,8 +689,17 @@ class WifiAnt(App):
         t.append("\nkeys\n", style="bold")
         for k, v in (("r", "record / stop"), ("s", "runs + compare"),
                      ("x", "speed test"), ("f", "focus mode"),
-                     ("a", "new revision"), ("⇧↑⇩", "chart range")):
+                     ("t", "tare to now"), ("m", "smoothing on/off"),
+                     ("n", "auto-record"), ("⇧↑⇩", "chart range")):
             t.append(f"  {k:<3} {v}\n", style=FAINT)
+        state = []
+        if self.tare_value is not None:
+            state.append(f"tare {self.tare_value:.1f}")
+        state.append(f"smooth {'off' if not self.smooth else str(self.smooth)}")
+        if self.autorecord:
+            state.append("AUTO-REC")
+        t.append("  " + "  ".join(state) + "\n", style=FAINT if not self.autorecord
+                 else "bold red")
         return t
 
     # -- baseline --------------------------------------------------------
@@ -684,7 +729,8 @@ class WifiAnt(App):
 
     # -- actions ---------------------------------------------------------
     def action_focus(self) -> None:
-        self.push_screen(FocusScreen(self.collector, self.baseline))
+        self.push_screen(FocusScreen(self.collector, self.baseline,
+                                     self.tare_value))
 
     def action_log(self) -> None:
         h = self.collector.history
@@ -721,6 +767,58 @@ class WifiAnt(App):
         delta = int(amount.strip("()"))
         self.headroom = max(-30, min(30, self.headroom + delta))
         self.paint()
+
+    def action_tare(self) -> None:
+        """Zero the reading to the current signal, so the next element trim
+        reads as a delta. Second press clears it."""
+        if self.tare_value is not None:
+            self.tare_value = None
+            self.tare_at = None
+            self.notify("tare cleared")
+        else:
+            last = self.collector.history.last
+            if last is None:
+                self.notify("no sample to tare against yet", severity="warning")
+                return
+            self.tare_value = last.signal
+            self.tare_at = time.time()
+            self.notify(f"tared at {last.signal:.1f} dBm — deltas from here")
+        self.paint()
+
+    def action_smooth(self) -> None:
+        self.smooth = 0 if self.smooth else 10
+        self.notify(f"smoothing {'off' if not self.smooth else f'{self.smooth}s'}")
+        self.paint()
+
+    def action_autorecord(self) -> None:
+        """Keep a run going without remembering to press r. Saves the previous
+        run and starts a fresh one each time it rolls over."""
+        self.autorecord = not self.autorecord
+        if self.autorecord:
+            if not self.design_slug:
+                self.autorecord = False
+                self.notify("pick a revision first (d)", severity="warning")
+                return
+            if not self.recorder:
+                self.recorder = labmod.Recorder(self.design_slug)
+                self.recording_started = time.time()
+            self.notify("auto-record on — press n again to stop")
+        else:
+            self.notify("auto-record off (current run still open; r saves it)")
+        self.paint()
+
+    def _autorecord_tick(self) -> None:
+        """Split the run every 10 min so a long session stays comparable."""
+        if not (self.autorecord and self.recorder):
+            return
+        if self.recorder.elapsed < 600:
+            return
+        meta = self.recorder.stop("auto-record segment")
+        if meta.series:
+            self.lab.save_session(meta)
+        self.recorder = labmod.Recorder(self.design_slug)
+        self.recording_started = time.time()
+        self.notify(f"auto-saved {meta.span:.0f}s segment")
 
     def action_overlay(self) -> None:
         if not self.baseline:
