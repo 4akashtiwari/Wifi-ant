@@ -32,9 +32,37 @@ needs three things it doesn't give you:
 
 ## Install
 
+One line, no sudo, nothing written outside your home directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/4akashtiwari/Wifi-ant/main/install.sh | bash
+```
+
+Or clone and run it yourself if you'd rather read it first:
+
 ```sh
 git clone https://github.com/4akashtiwari/Wifi-ant
 cd Wifi-ant
+./install.sh
+```
+
+Either way you get a private venv at `~/.local/share/wifiant/venv` and a
+`wifiant` launcher in `~/.local/bin`. If that directory isn't on your `PATH`,
+the script tells you the one line to add.
+
+```sh
+./install.sh --system        # /usr/local, needs sudo
+./install.sh --dev           # editable install + pytest
+./install.sh --systemd       # also install a daily logger as a user unit
+./install.sh --uninstall     # removes the venv, keeps your recorded runs
+```
+
+`--uninstall` deliberately leaves `designs/` and `watch/` alone. Months of
+measurements shouldn't disappear because you tidied up a venv.
+
+### Manual install
+
+```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .
 ```
@@ -191,6 +219,7 @@ Worth knowing before you rebuild a good design.
 ## Layout
 
 ```
+install.sh      zero-sudo installer (venv + launcher, --uninstall keeps data)
 wifiant/
   radio.py      read-only sampling: iw, /proc/net/wireless, nmcli, ping
   collector.py  background sampler thread + ring history
